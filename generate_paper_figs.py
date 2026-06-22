@@ -459,50 +459,143 @@ def metric_eff_rank(M):
     return float(np.exp(-np.sum(p * np.log(p + 1e-12))))
 
 
+def _load_individual_seeds(mask_id, dataset):
+    """Load per-seed avg_ratio for a single mask_id from stage3."""
+    result = {}
+    with open(STAGE3) as f:
+        for r in csv.DictReader(f):
+            if r["dataset"] == dataset and r["mask_id"] == mask_id:
+                result[int(r["seed"])] = float(r["avg_ratio"])
+    return result
+
+
+def _load_dss_individual_seeds(hub, dataset):
+    """Load per-seed avg_ratio for a single DSS hub."""
+    result = {}
+    if dataset == "mnist":
+        with open(DSS_DIR / "validation_results_v3.csv") as f:
+            for r in csv.DictReader(f):
+                if int(r["hub"]) == hub:
+                    result[int(r["seed"])] = float(r["avg_ratio"])
+    else:
+        with open(P2_F) as f:
+            for r in csv.DictReader(f):
+                if int(r["hub"]) == hub:
+                    result[int(r["seed"])] = float(r["avg_ratio"])
+    with open(P3) as f:
+        for r in csv.DictReader(f):
+            if r["dataset"] == dataset and r["mask_id"] == f"v3_hub{hub}":
+                result[int(r["seed"])] = float(r["avg_ratio"])
+    return result
+
+
+def _load_dp_mean_seeds(fan_key, dataset):
+    """Load per-seed avg_ratio averaged over 5 DP rewires of a given fan."""
+    by_seed = defaultdict(list)
+    with open(STAGE3) as f:
+        for r in csv.DictReader(f):
+            if r["dataset"] == dataset and r["mask_id"].startswith(f"dp_fan_{fan_key}_"):
+                by_seed[int(r["seed"])].append(float(r["avg_ratio"]))
+    return {s: float(np.mean(v)) for s, v in by_seed.items()}
+
+
+def _load_rs_mean_seeds(dataset):
+    """Load per-seed avg_ratio averaged over 5 RS masks."""
+    by_seed = defaultdict(list)
+    with open(STAGE3) as f:
+        for r in csv.DictReader(f):
+            if r["dataset"] == dataset and r["mask_id"].startswith("rs_"):
+                by_seed[int(r["seed"])].append(float(r["avg_ratio"]))
+    return {s: float(np.mean(v)) for s, v in by_seed.items()}
+
+
+# Academic naming for Table 1
+# - DSS-Motif-{1,2,3}: differentiable subgraph search discovered motifs
+# - Fan-α/β/γ: hand-selected connectome fan-in structures
+# - DP(Fan-α/β/γ): degree-preserved rewires (averaged over 5 rewires)
+# - Random-Sparse: uniform random edge placement (averaged over 5 masks)
+# - Dense: fully-connected hidden layer (upper bound)
+TABLE1_STRUCTURES = [
+    # (display_name, category, loader_args)
+    ("DSS-Motif-1",       "DSS (ours)",       ("dss", 28)),
+    ("DSS-Motif-2",       "DSS (ours)",       ("dss", 45)),
+    ("DSS-Motif-3",       "DSS (ours)",       ("dss", 26)),
+    ("Fan-α",             "Connectome fan",   ("stage3", "fan_fan_alpha")),
+    ("Fan-β",             "Connectome fan",   ("stage3", "fan_fan_beta")),
+    ("Fan-γ",             "Connectome fan",   ("stage3", "fan_fan_gamma")),
+    ("DP(Fan-α)",         "Degree-preserved", ("dp", "alpha")),
+    ("DP(Fan-β)",         "Degree-preserved", ("dp", "beta")),
+    ("DP(Fan-γ)",         "Degree-preserved", ("dp", "gamma")),
+    ("Random-Sparse",     "Random baseline",  ("rs",)),
+]
+
+
 def table1_main():
-    """Family avg_ratio with embedded paired-Wilcoxon vs DSS-Motif."""
+    """Per-structure AvgRatio with paired Wilcoxon test vs best DSS-Motif."""
+    fieldnames = ["structure", "category", "dataset", "n_seeds",
+                  "avg_ratio_mean", "avg_ratio_std",
+                  "delta_vs_best_DSS", "p_vs_best_DSS", "cohen_dz"]
     rows = []
+
     for ds in ["mnist", "fashion_mnist"]:
-        dss = dss_seeds_full(ds)
-        fan = load_stage3_seeds(lambda m: m.startswith("fan_fan"), ds)
-        dp  = load_stage3_seeds(lambda m: m.startswith("dp_fan"),  ds)
+        # Load all structures
+        struct_seeds = {}
+        for name, cat, args in TABLE1_STRUCTURES:
+            if args[0] == "dss":
+                seeds = _load_dss_individual_seeds(args[1], ds)
+            elif args[0] == "stage3":
+                seeds = _load_individual_seeds(args[1], ds)
+            elif args[0] == "dp":
+                seeds = _load_dp_mean_seeds(args[1], ds)
+            elif args[0] == "rs":
+                seeds = _load_rs_mean_seeds(ds)
+            else:
+                seeds = {}
+            struct_seeds[name] = seeds
 
-        def stat_vs_dss(other):
-            common = sorted(set(dss) & set(other))
-            diffs = [other[s] - dss[s] for s in common]
-            W, p = wilcoxon(diffs)
-            return (round(np.mean(diffs), 4), round(p, 4),
-                    round(cohen_dz(diffs), 3))
+        # Best DSS reference: per-seed max across 3 DSS motifs
+        dss_names = [n for n, c, _ in TABLE1_STRUCTURES if c == "DSS (ours)"]
+        dss_all_seeds = set()
+        for dn in dss_names:
+            dss_all_seeds |= set(struct_seeds[dn].keys())
+        best_dss = {}
+        for s in dss_all_seeds:
+            vals = [struct_seeds[dn][s] for dn in dss_names if s in struct_seeds[dn]]
+            if vals:
+                best_dss[s] = max(vals)
 
-        fan_md, fan_p, fan_dz = stat_vs_dss(fan)
-        dp_md,  dp_p,  dp_dz  = stat_vs_dss(dp)
+        for name, cat, _ in TABLE1_STRUCTURES:
+            seeds = struct_seeds[name]
+            if not seeds:
+                continue
+            vals = list(seeds.values())
+            # Paired test vs best DSS
+            common = sorted(set(seeds) & set(best_dss))
+            if common and cat != "DSS (ours)":
+                diffs = [seeds[s] - best_dss[s] for s in common]
+                W, p = wilcoxon(diffs)
+                delta = round(np.mean(diffs), 4)
+                p_val = round(p, 4)
+                dz = round(cohen_dz(diffs), 3)
+            else:
+                delta, p_val, dz = "—", "—", "—"
 
-        # Baseline rows include stats vs DSS-Motif
-        rows.append({"family": "Fan-Motif (hand-picked)", "dataset": ds,
-                     "n_seeds": len(fan), "mean": round(np.mean(list(fan.values())), 4),
-                     "std":  round(np.std(list(fan.values())), 4),
-                     "diff_vs_DSS": fan_md, "p_vs_DSS": fan_p,
-                     "cohen_dz_vs_DSS": fan_dz})
-        rows.append({"family": "DegPres (degree-preserved)", "dataset": ds,
-                     "n_seeds": len(dp), "mean": round(np.mean(list(dp.values())), 4),
-                     "std":  round(np.std(list(dp.values())), 4),
-                     "diff_vs_DSS": dp_md, "p_vs_DSS": dp_p,
-                     "cohen_dz_vs_DSS": dp_dz})
-        # DSS-Motif row: no self-comparison
-        rows.append({"family": "DSS-Motif (ours)", "dataset": ds,
-                     "n_seeds": len(dss),
-                     "mean": round(np.mean(list(dss.values())), 4),
-                     "std":  round(np.std(list(dss.values())), 4),
-                     "diff_vs_DSS": "—", "p_vs_DSS": "—",
-                     "cohen_dz_vs_DSS": "—"})
+            rows.append({
+                "structure": name,
+                "category": cat,
+                "dataset": ds,
+                "n_seeds": len(vals),
+                "avg_ratio_mean": round(np.mean(vals), 4),
+                "avg_ratio_std": round(np.std(vals), 4),
+                "delta_vs_best_DSS": delta,
+                "p_vs_best_DSS": p_val,
+                "cohen_dz": dz,
+            })
 
     with open(FIGS / "table1_main.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["family", "dataset", "n_seeds",
-                                            "mean", "std",
-                                            "diff_vs_DSS", "p_vs_DSS",
-                                            "cohen_dz_vs_DSS"])
+        w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader(); w.writerows(rows)
-    print("Wrote table1_main.csv (with embedded stats)")
+    print("Wrote table1_main.csv (per-structure, with paired stats vs best DSS)")
 
 
 def table2_stats():
